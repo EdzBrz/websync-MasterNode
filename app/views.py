@@ -103,12 +103,12 @@ def set_sync():
 
 # Go through all nodes and files again and set synced bool on node
    for n in nodes:
-      # First case: Node has less files than server list
-      # Stick a bone in it, you're done
+      # Node has less files than server list
       if len(n.files) < file_count():
          n.synced = False
          db.session.add(n)
          continue
+      # 
       for f in (n.files):
          if f.timestamp < filestamps[f.fileid-1]:
             n.synced = False
