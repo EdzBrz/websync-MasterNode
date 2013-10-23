@@ -1,12 +1,11 @@
 from flask import Flask, jsonify, request, abort
 from app import app, db
 from app.models import Node, NodeFile
-import datetime
+import datetime, requests, json, logging
 from decorators import async
 from pprint import pprint
 from sqlalchemy.exc import IntegrityError
 
-# Index-1 is FileID and element is timestamp for the newest version of the file
 filestamps = []
 
 @app.route('/', methods = ['GET'])
@@ -28,10 +27,11 @@ def add_node():
          db.session.add(n)
          db.session.commit()         
       except IntegrityError:
-         #TODO: Nodes returns to network when not properly turned off, need to check its files for sync
+         #TODO: Nodes returns to network when not properly turned off, need to check its files for conflicts
          pprint('Node already in network!')
          db.session.rollback()
          n = db.session.query(Node).filter(Node.ipaddr==ip).first()
+         #conflict_check(n)
       return jsonify ({'Node': n.id}), 201 
    else:
       abort(400)
@@ -52,15 +52,26 @@ def add_file():
       ts = datetime.datetime.strptime(request.json['timestamp'], '%Y-%m-%d %H:%M:%S.%f')
       n = db.session.query(Node).filter(Node.ipaddr == nodeURL).first()
       nf = NodeFile(fileid=int(request.json['fileid']), timestamp=ts, node_id=n.id)
-      db.session.add(n)
       db.session.add(nf)
       db.session.commit()
+      logging.info('POST From: '+str(nodeURL)+' File: '+str(request.json['fileid']))
       set_sync()
       return jsonify({'File added': nf.fileid }), 201
 
 @app.route('/put/', methods = ['POST'])
 def update_file():
-   return ""
+   if request.json:
+      nodeURL = 'http://'+(request.remote_addr)+':'+str(request.json['port'])+'/'
+      ts = datetime.datetime.strptime(request.json['timestamp'], '%Y-%m-%d %H:%M:%S.%f')
+      n = db.session.query(Node).filter(Node.ipaddr == nodeURL).first()
+      nfs = NodeFile.query.filter(NodeFile.fileid==int(request.json['fileid']))
+      for nf in nfs:
+         if nf.node == n:
+            nf.timestamp = ts
+            db.session.commit()
+      logging.info('PUT From: '+str(nodeURL)+' File: '+str(request.json['fileid']))
+      set_sync()
+      return jsonify({'File updated': nf.fileid }), 201
 
 @app.route('/delete/', methods = ['POST'])
 def delete_file():
@@ -70,24 +81,33 @@ def delete_file():
    for nf in nfs:
       if nf.timestamp > ts:
          abort(400)
-      db.session.delete(nf)
+      # Mark nodefile for deletion
+      if nf.node.ipaddr == nodeURL:
+         db.session.delete(nf)
+      nf.timestamp = datetime.datetime(1,1,1,1,1,1,1)
+   logging.info('DELETE From: '+str(nodeURL)+' File: '+str(request.json['fileid']))
+   set_sync()
    db.session.commit()
 
    # When deleting file, set dummy datetime on deleted fileID. Will be ignored on sync and will be replaced by all time comparisons
    global filestamps
-   filestamps[int(request.json['fileid'])-1] = datetime.datetime(1,1,1,1,1,1,1)
-   set_sync()
+   pprint(int(request.json['fileid']))
+   try:
+      filestamps[int(request.json['fileid'])] = datetime.datetime(1,1,1,1,1,1,1)
+   except IndexError:
+      filestamps.append(datetime.datetime(1,1,1,1,1,1,1))
+   return jsonify({'File removed': int(request.json['fileid'])}), 200
 
-   return jsonify({'File removed': int(request.json['fileid'])}), 201
+@app.route('/next/', methods = ['GET'])
+def get_next_file_id():
+   return jsonify ({'nextID': (len(filestamps))})
 
-# Used for newly created CoreOS VM on OpenStack to get correct docker container
-# Might use dockers own repo system for this though
-@app.route('/docker', methods = ['GET'])
-def get_docker():
-   return ""
+@app.route('/sync/', methods = ['GET'])
+def force_sync():
+   push_changes()
+   return jsonify ({'Syncing': '!'}), 200
 
 # Set sync booleans for all nodes to correct state of node
-@async
 def set_sync():
 # Go through all files on all nodes and update global filestamps array to have all the newest timestamps for all fileIDs
    nodes = Node.query.all()
@@ -95,41 +115,96 @@ def set_sync():
    for n in nodes:
       for f in (n.files):
          try:
-            if f.timestamp > filestamps[f.fileid-1]:
-               filestamps[f.fileid-1] = f.timestamp
+            if f.timestamp > filestamps[f.fileid]:
+               filestamps[f.fileid] = f.timestamp
          except IndexError:
             filestamps.append(f.timestamp)
-   pprint(filestamps)
-
+   logging.info('MasterServer Timestamps: '+str(filestamps))   
 # Go through all nodes and files again and set synced bool on node
    for n in nodes:
       # Node has less files than server list
       if len(n.files) < file_count():
          n.synced = False
+         logging.info('Node :'+str(n.ipaddr)+' unsynced: has less files than master')
          db.session.add(n)
          continue
-      # 
+      # Iterate over files and compare them to newest
       for f in (n.files):
-         if f.timestamp < filestamps[f.fileid-1]:
+         if f.timestamp < filestamps[f.fileid] or f.timestamp == datetime.datetime(1,1,1,1,1,1,1):
             n.synced = False
-            pprint('unsynced')
+            logging.info('Node '+str(n.ipaddr)+' File: '+str(f.fileid)+' unsynced: older file than master')
             break
          n.synced = True
-         pprint('synced')
+         logging.info('Node '+str(n.ipaddr)+' File: '+str(f.fileid)+' synced!')
       db.session.add(n)
    db.session.commit()
             
-
 def file_count():
    x = [elem for elem in filestamps if elem != datetime.datetime(1,1,1,1,1,1,1)]
    return len(x)
+
+def file_ids():
+   filelist = []
+   for elem in filestamps:
+      if elem != datetime.datetime(1,1,1,1,1,1,1):
+         filelist.append(filestamps.index(elem))
+   return filelist
+
      
 #TODO: FIX THIS, query doesnt become empty list even if all nodes are synced
-def check_sync():
-   derp = db.session.query(Node).filter(Node.synced == 'false')
-   if derp:
-      pprint('Starting Sync')
-   else:
-      pprint('Nothing to see here')
+def push_changes():
+   receivers = db.session.query(Node).filter(Node.synced == False)
+   send_list = []
+   files = file_ids()
+   #TODO: Sync logic here
+   for r in receivers:
+      nodefiles = [] 
+      for f in r.files:
+         nodefiles.append(f.fileid)       
+         if f.timestamp < filestamps[f.fileid]:
+            send_list.append((r,f.fileid,'put'))
+
+         elif f.timestamp == datetime.datetime(1,1,1,1,1,1,1):
+            send_list.append((r,f.fileid,'delete'))
+
+      logging.info('Push Changes: Nodefiles: '+str(nodefiles)+' For node: '+str(r.id))
+      postfiles = list(set(files)-set(nodefiles))
+      for p in postfiles:
+         send_list.append((r,p,'post'))
+      
+   pprint('Send list: '+str(send_list))
+   for s in send_list:
+      node_sender(*s)
+
+# Sends one command to a node   
+def node_sender(node, fileid, method):
+   headers = {'content-type': 'application/json'}
+   logging.info('Node sender: '+str(node.ipaddr)+' Fileid: '+str(fileid)+' Method: '+str(method))
+   if method == 'delete':
+      data={'global_id':fileid}
+      requests.delete(str(node.ipaddr)+'blob/'+str(fileid)+'/', data=json.dumps(data), headers=headers)
+   else:   
+      data={'nodeurl':node.ipaddr, 'fileid':fileid, 'method': method}
+      headers = {'content-type': 'application/json'}
+      # Get node with synced file
+      # TODO: Add logic for which node has to send, now it only takes the first one with the correct file
+      n = db.session.query(NodeFile).filter(NodeFile.fileid == fileid).filter(NodeFile.timestamp == filestamps[fileid])
+      for i in n:
+         logging.info('Available Node: '+str(i.node.ipaddr))
+      url = n.first()
+      tarURL = url.node.ipaddr + 'mn/'
+      requests.get(tarURL, data=json.dumps(data), headers=headers)
+
+# Compare timestamps from master and returned node for conflicts
+def conflict_check(node):
+   timestamp_list = []
+   for f in node.files:
+      timestamp_list.append(f.timestamp)
+      r = requests.get(str(node.ipaddr)+'reconnect')
    
    
+
+
+
+
+
