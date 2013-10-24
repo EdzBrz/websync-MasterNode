@@ -28,7 +28,7 @@ def add_node():
          db.session.commit()         
       except IntegrityError:
          #TODO: Nodes returns to network when not properly turned off, need to check its files for conflicts
-         pprint('Node already in network!')
+         #pprint('Node already in network!')
          db.session.rollback()
          n = db.session.query(Node).filter(Node.ipaddr==ip).first()
          #conflict_check(n)
@@ -54,7 +54,7 @@ def add_file():
       nf = NodeFile(fileid=int(request.json['fileid']), timestamp=ts, node_id=n.id)
       db.session.add(nf)
       db.session.commit()
-      logging.info('POST From: '+str(nodeURL)+' File: '+str(request.json['fileid']))
+      #pprint('POST From: '+str(nodeURL)+' File: '+str(request.json['fileid']))
       set_sync()
       return jsonify({'File added': nf.fileid }), 201
 
@@ -69,9 +69,9 @@ def update_file():
          if nf.node == n:
             nf.timestamp = ts
             db.session.commit()
-      logging.info('PUT From: '+str(nodeURL)+' File: '+str(request.json['fileid']))
+      #pprint('PUT From: '+str(nodeURL)+' File: '+str(request.json['fileid']))
       set_sync()
-      return jsonify({'File updated': nf.fileid }), 201
+      return jsonify({'File updated': int(request.json['fileid']) }), 201
 
 @app.route('/delete/', methods = ['POST'])
 def delete_file():
@@ -85,13 +85,13 @@ def delete_file():
       if nf.node.ipaddr == nodeURL:
          db.session.delete(nf)
       nf.timestamp = datetime.datetime(1,1,1,1,1,1,1)
-   logging.info('DELETE From: '+str(nodeURL)+' File: '+str(request.json['fileid']))
+   #pprint('DELETE From: '+str(nodeURL)+' File: '+str(request.json['fileid']))
    set_sync()
    db.session.commit()
 
    # When deleting file, set dummy datetime on deleted fileID. Will be ignored on sync and will be replaced by all time comparisons
    global filestamps
-   pprint(int(request.json['fileid']))
+   #pprint(int(request.json['fileid']))
    try:
       filestamps[int(request.json['fileid'])] = datetime.datetime(1,1,1,1,1,1,1)
    except IndexError:
@@ -119,23 +119,23 @@ def set_sync():
                filestamps[f.fileid] = f.timestamp
          except IndexError:
             filestamps.append(f.timestamp)
-   logging.info('MasterServer Timestamps: '+str(filestamps))   
+   #pprint('MasterServer Timestamps: '+str(filestamps))   
 # Go through all nodes and files again and set synced bool on node
    for n in nodes:
       # Node has less files than server list
       if len(n.files) < file_count():
          n.synced = False
-         logging.info('Node :'+str(n.ipaddr)+' unsynced: has less files than master')
+         #pprint('Node :'+str(n.ipaddr)+' unsynced: has less files than master')
          db.session.add(n)
          continue
       # Iterate over files and compare them to newest
       for f in (n.files):
          if f.timestamp < filestamps[f.fileid] or f.timestamp == datetime.datetime(1,1,1,1,1,1,1):
             n.synced = False
-            logging.info('Node '+str(n.ipaddr)+' File: '+str(f.fileid)+' unsynced: older file than master')
+            #pprint('Node '+str(n.ipaddr)+' File: '+str(f.fileid)+' unsynced: older file than master')
             break
          n.synced = True
-         logging.info('Node '+str(n.ipaddr)+' File: '+str(f.fileid)+' synced!')
+         #pprint('Node '+str(n.ipaddr)+' File: '+str(f.fileid)+' synced!')
       db.session.add(n)
    db.session.commit()
             
@@ -167,19 +167,21 @@ def push_changes():
          elif f.timestamp == datetime.datetime(1,1,1,1,1,1,1):
             send_list.append((r,f.fileid,'delete'))
 
-      logging.info('Push Changes: Nodefiles: '+str(nodefiles)+' For node: '+str(r.id))
+      #pprint('Push Changes: Nodefiles: '+str(nodefiles)+' For node: '+str(r.id))
       postfiles = list(set(files)-set(nodefiles))
       for p in postfiles:
          send_list.append((r,p,'post'))
       
+   pprint('Filestamps:'+str(filestamps))
    pprint('Send list: '+str(send_list))
    for s in send_list:
       node_sender(*s)
 
-# Sends one command to a node   
+# Sends one command to a node 
+@async 
 def node_sender(node, fileid, method):
    headers = {'content-type': 'application/json'}
-   logging.info('Node sender: '+str(node.ipaddr)+' Fileid: '+str(fileid)+' Method: '+str(method))
+   #pprint('Node sender: '+str(node.ipaddr)+' Fileid: '+str(fileid)+' Method: '+str(method))
    if method == 'delete':
       data={'global_id':fileid}
       requests.delete(str(node.ipaddr)+'blob/'+str(fileid)+'/', data=json.dumps(data), headers=headers)
@@ -188,13 +190,13 @@ def node_sender(node, fileid, method):
       headers = {'content-type': 'application/json'}
       # Get node with synced file
       # TODO: Add logic for which node has to send, now it only takes the first one with the correct file
-      n = db.session.query(NodeFile).filter(NodeFile.fileid == fileid).filter(NodeFile.timestamp == filestamps[fileid])
-      for i in n:
-         logging.info('Available Node: '+str(i.node.ipaddr))
-      url = n.first()
-      tarURL = url.node.ipaddr + 'mn/'
-      requests.get(tarURL, data=json.dumps(data), headers=headers)
-
+      n = db.session.query(NodeFile).filter(NodeFile.fileid == fileid).filter(NodeFile.timestamp == filestamps[fileid]).first()
+      if n:
+         url = n
+         tarURL = url.node.ipaddr + 'mn/'
+         requests.get(tarURL, data=json.dumps(data), headers=headers)
+      else:
+         filestamps[fileid] = datetime.datetime(1,1,1,1,1,1,1)
 # Compare timestamps from master and returned node for conflicts
 def conflict_check(node):
    timestamp_list = []
