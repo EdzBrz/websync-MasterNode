@@ -5,8 +5,13 @@ import datetime, requests, json, logging
 from decorators import async
 from pprint import pprint
 from sqlalchemy.exc import IntegrityError
+from tornado.ioloop import PeriodicCallback
 
 filestamps = []
+
+@app.before_first_request
+def periodic_sync():
+   PeriodicCallback(push_changes, 5000).start()
 
 @app.route('/', methods = ['GET'])
 @app.route('/nodes', methods = ['GET'])
@@ -25,14 +30,19 @@ def add_node():
       try:   
          n = Node(ipaddr=ip)
          db.session.add(n)
-         db.session.commit()         
+         db.session.commit()        
       except IntegrityError:
-         #TODO: Nodes returns to network when not properly turned off, need to check its files for conflicts
+         #Nodes returns to network when not properly turned off, need to check its files for conflicts
          #pprint('Node already in network!')
          db.session.rollback()
          n = db.session.query(Node).filter(Node.ipaddr==ip).first()
-         #conflict_check(n)
-      return jsonify ({'Node': n.id}), 201 
+         
+      if 'filelist' in request.json:
+         c = conflict_check(n, request.json['filelist'])
+         if c:
+            return jsonify({'Node': n.id, 'Conflicts':c }), 201
+      
+      return jsonify ({'Node': n.id}), 201
    else:
       abort(400)
 
@@ -49,7 +59,7 @@ def delete_node(id):
 def add_file():
    if request.json:
       nodeURL = 'http://'+(request.remote_addr)+':'+str(request.json['port'])+'/'
-      ts = datetime.datetime.strptime(request.json['timestamp'], '%Y-%m-%d %H:%M:%S.%f')
+      ts = string_to_timestamp(request.json['timestamp'])
       n = db.session.query(Node).filter(Node.ipaddr == nodeURL).first()
       nf = NodeFile(fileid=int(request.json['fileid']), timestamp=ts, node_id=n.id)
       db.session.add(nf)
@@ -62,7 +72,7 @@ def add_file():
 def update_file():
    if request.json:
       nodeURL = 'http://'+(request.remote_addr)+':'+str(request.json['port'])+'/'
-      ts = datetime.datetime.strptime(request.json['timestamp'], '%Y-%m-%d %H:%M:%S.%f')
+      ts = string_to_timestamp(request.json['timestamp'])
       n = db.session.query(Node).filter(Node.ipaddr == nodeURL).first()
       nfs = NodeFile.query.filter(NodeFile.fileid==int(request.json['fileid']))
       for nf in nfs:
@@ -76,8 +86,8 @@ def update_file():
 @app.route('/delete/', methods = ['POST'])
 def delete_file():
    nodeURL = 'http://'+(request.remote_addr)+':'+str(request.json['port'])+'/'
-   ts = datetime.datetime.strptime(request.json['timestamp'], '%Y-%m-%d %H:%M:%S.%f')
    nfs = db.session.query(NodeFile).filter(NodeFile.fileid == int(request.json['fileid']))
+   ts = nfs.join(NodeFile.node, aliased=True).filter_by(ipaddr=nodeURL).first().timestamp
    for nf in nfs:
       if nf.timestamp > ts:
          abort(400)
@@ -119,7 +129,8 @@ def set_sync():
                filestamps[f.fileid] = f.timestamp
          except IndexError:
             filestamps.append(f.timestamp)
-   #pprint('MasterServer Timestamps: '+str(filestamps))   
+   #pprint('MasterServer Timestamps: '+str(filestamps))
+   
 # Go through all nodes and files again and set synced bool on node
    for n in nodes:
       # Node has less files than server list
@@ -145,18 +156,16 @@ def file_count():
 
 def file_ids():
    filelist = []
-   for elem in filestamps:
+   for idx, elem in enumerate(filestamps):
       if elem != datetime.datetime(1,1,1,1,1,1,1):
-         filelist.append(filestamps.index(elem))
+         filelist.append(idx)
    return filelist
 
-     
-#TODO: FIX THIS, query doesnt become empty list even if all nodes are synced
+
 def push_changes():
    receivers = db.session.query(Node).filter(Node.synced == False)
    send_list = []
    files = file_ids()
-   #TODO: Sync logic here
    for r in receivers:
       nodefiles = [] 
       for f in r.files:
@@ -172,8 +181,8 @@ def push_changes():
       for p in postfiles:
          send_list.append((r,p,'post'))
       
-   pprint('Filestamps:'+str(filestamps))
-   pprint('Send list: '+str(send_list))
+   #pprint('Filestamps:'+str(filestamps))
+   #pprint('Send list: '+str(send_list))
    for s in send_list:
       node_sender(*s)
 
@@ -197,16 +206,30 @@ def node_sender(node, fileid, method):
          requests.get(tarURL, data=json.dumps(data), headers=headers)
       else:
          filestamps[fileid] = datetime.datetime(1,1,1,1,1,1,1)
+         
+
 # Compare timestamps from master and returned node for conflicts
-def conflict_check(node):
-   timestamp_list = []
+def conflict_check(node, filelist):
+   node_ts = {}
+   conflicts = {}  
+   new_ids = [f.get('fileid') for f in filelist] 
    for f in node.files:
-      timestamp_list.append(f.timestamp)
-      r = requests.get(str(node.ipaddr)+'reconnect')
+      if f.fileid not in new_ids:
+         conflicts[f.fileid] = 'delete'
+      node_ts[f.fileid] = f.timestamp
    
-   
+   for f in filelist:
+      id = f.get('fileid')
+      ts = string_to_timestamp(f.get('timestamp'))
+      nts = node_ts.get(id)
+      # Something has happend with the file while offline     
+      if nts and nts < ts and nts == filestamps[id]:
+         conflicts[id]='put'
+      elif nts != ts:
+         conflicts[id]='post'
+   pprint(str(conflicts))
+   return conflicts
 
 
-
-
-
+def string_to_timestamp(timestamp):
+   return datetime.datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S.%f')
